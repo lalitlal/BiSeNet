@@ -23,6 +23,7 @@ from lib.models import model_factory
 from configs import cfg_factory
 from lib.logger import setup_logger
 from lib.cityscapes_cv2 import get_data_loader
+import time
 
 
 
@@ -35,11 +36,15 @@ class MscEvalV0(object):
 
     def __call__(self, net, dl, n_classes):
         ## evaluate
+        tot_time = 0
+        tots = 0
         hist = torch.zeros(n_classes, n_classes).cuda().detach()
         if dist.is_initialized() and dist.get_rank() != 0:
             diter = enumerate(dl)
         else:
             diter = enumerate(tqdm(dl))
+        total_time = 0
+        num_images = 0
         for i, (imgs, label) in diter:
             N, _, H, W = label.shape
             label = label.squeeze(1).cuda()
@@ -52,9 +57,13 @@ class MscEvalV0(object):
                         mode='bilinear', align_corners=True)
 
                 im_sc = im_sc.cuda()
+                start_time = time.time()
                 logits = net(im_sc)[0]
+                time_lapsed = time.time()-start_time
                 logits = F.interpolate(logits, size=size,
                         mode='bilinear', align_corners=True)
+                num_images += 1
+                total_time += time_lapsed
                 probs += torch.softmax(logits, dim=1)
                 if self.flip:
                     im_sc = torch.flip(im_sc, dims=(3, ))
@@ -64,11 +73,14 @@ class MscEvalV0(object):
                             mode='bilinear', align_corners=True)
                     probs += torch.softmax(logits, dim=1)
             preds = torch.argmax(probs, dim=1)
+            
+                
             keep = label != self.ignore_label
             hist += torch.bincount(
                 label[keep] * n_classes + preds[keep],
                 minlength=n_classes ** 2
                 ).view(n_classes, n_classes)
+        print(num_images, total_time, num_images/total_time)
         if dist.is_initialized():
             dist.all_reduce(hist, dist.ReduceOp.SUM)
         ious = hist.diag() / (hist.sum(dim=0) + hist.sum(dim=1) - hist.diag())
@@ -192,12 +204,14 @@ def eval_model(net, ims_per_gpu, im_root, im_anns):
 
     heads, mious = [], []
     logger = logging.getLogger()
-
+    
+    start_single = time.time()
     single_scale = MscEvalV0((1., ), False)
     mIOU = single_scale(net, dl, 19)
     heads.append('single_scale')
     mious.append(mIOU)
     logger.info('single mIOU is: %s\n', mIOU)
+    logger.info('time taken is: %s\n', (time.time() - start_single))
 
     single_crop = MscEvalCrop(
         cropsize=1024,
@@ -206,16 +220,21 @@ def eval_model(net, ims_per_gpu, im_root, im_anns):
         scales=(1., ),
         lb_ignore=255,
     )
+    start_single_crop = time.time()
     mIOU = single_crop(net, dl, 19)
     heads.append('single_scale_crop')
     mious.append(mIOU)
     logger.info('single scale crop mIOU is: %s\n', mIOU)
+    logger.info('time taken is: %s\n', (time.time() - start_single_crop))
 
+    
     ms_flip = MscEvalV0((0.5, 0.75, 1, 1.25, 1.5, 1.75), True)
+    start_ms_flip = time.time()
     mIOU = ms_flip(net, dl, 19)
     heads.append('ms_flip')
     mious.append(mIOU)
     logger.info('ms flip mIOU is: %s\n', mIOU)
+    logger.info('time taken is: %s\n', (time.time() - start_ms_flip))
 
     ms_flip_crop = MscEvalCrop(
         cropsize=1024,
@@ -224,10 +243,12 @@ def eval_model(net, ims_per_gpu, im_root, im_anns):
         scales=(0.5, 0.75, 1.0, 1.25, 1.5, 1.75),
         lb_ignore=255,
     )
+    start_ms_crop = time.time()
     mIOU = ms_flip_crop(net, dl, 19)
     heads.append('ms_flip_crop')
     mious.append(mIOU)
     logger.info('ms crop mIOU is: %s\n', mIOU)
+    logger.info('time taken is: %s\n', (time.time() - start_ms_crop))
     return heads, mious
 
 
@@ -240,6 +261,10 @@ def evaluate(cfg, weight_pth):
     #  net = BiSeNetV2(19)
     net.load_state_dict(torch.load(weight_pth))
     net.cuda()
+#     pytorch_total_params = sum(p.numel() for p in net.parameters())
+    pytorch_total_params = sum(p.numel() for p in net.parameters() if p.requires_grad)
+
+    print('total parameters: ', pytorch_total_params)
 
     is_dist = dist.is_initialized()
     if is_dist:
