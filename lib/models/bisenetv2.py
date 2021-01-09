@@ -22,6 +22,96 @@ class ConvBNReLU(nn.Module):
         feat = self.relu(feat)
         return feat
 
+class DSConv(nn.Module):
+    """Depthwise Separable convolutions"""
+    def __init__(self, dw_channels, out_channels, stride=1, dilation=1, padding=1):
+        super(DSConv, self).__init__()
+        self.conv = nn.Sequential(
+            nn.Conv2d(dw_channels, dw_channels, 3, stride, padding=padding, groups=dw_channels, dilation=dilation, bias=False),
+            nn.BatchNorm2d(dw_channels),
+            nn.ReLU(True),
+            nn.Conv2d(dw_channels,out_channels, 1, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(True)
+        )
+    
+    def forward(self, x):
+        return self.conv(x)
+
+class StemBlock_Shared(nn.Module):
+
+    def __init__(self):
+        super(StemBlock_Shared, self).__init__()
+        self.conv = ConvBNReLU(3, 16, 3, stride=1, dilation=1)
+        self.left = nn.Sequential(
+            ConvBNReLU(16, 8, 1, stride=1, padding=0),
+            DSConv(8, 16, stride=2),
+        )
+        self.right = nn.MaxPool2d(
+            kernel_size=3, stride=2, padding=1, ceil_mode=False)
+        self.fuse = DSConv(32, 16, stride=1)
+
+    def forward(self, x):
+        feat = self.conv(x)
+        feat_left = self.left(feat)
+        feat_right = self.right(feat)
+        feat = torch.cat([feat_left, feat_right], dim=1)
+        feat = self.fuse(feat)
+        return feat # H/2, W/2, 16
+
+class LearningToDownsample(nn.Module):
+    """Learning to downsample module """
+
+    def __init__(self, dw_channels1=32, dw_channels2=48, out_channels=64):
+        super(LearningToDownsample, self).__init__()
+        self.stem = StemBlock_Shared() # this is replaced by the shared LTDS, but should can expect to get H/2, H/2, 16
+        # self.conv = ConvBNReLU(3, dw_channels1,3,2) # /2
+        
+        padding_1 = ((dw_channels1-1)*1 - 16 + 2*(3-1)+1)/2.0
+        padding_2 = ((128-1)*1 - 128 + 5)/2.0
+
+        self.dsconv1 = DSConv(16, dw_channels1) # /2, 32        
+        self.dsconv2 = DSConv(dw_channels1, dw_channels2, stride=2, dilation=1) # /4, 48
+        self.dsconv3= DSConv(dw_channels2, 16, 1, 1) # /4, 16
+
+        self.ge2 = GELayerS2(dw_channels2, out_channels) # /8, 64
+        self.dsconv4 = DSConv(out_channels, 128, 1) # /8, 128
+        self.dsconv5 = DSConv(128, 128, 1, 2, int(padding_2)) #/8, 128
+        self.dsconv6 = DSConv(128, 128)
+
+    def forward(self, x):
+        shared = self.stem(x) # /2, 16
+        shared = self.dsconv1(shared) # /2, 32
+        shared = self.dsconv2(shared) # /4, 48
+        semantic = self.dsconv3(shared) # /4, 16
+        detail = self.ge2(shared) # /8, 64
+        detail = self.dsconv4(detail) # /8, 128
+        detail = self.dsconv5(detail) # /8, 128, dilated
+        detail = self.dsconv6(detail)
+        return semantic, detail
+
+class Classifier(nn.Module):
+    """Classifier module replaces SegmentHead"""
+
+    def __init__(self, dw_channels, mid_channels, num_classes, up_factor=8, aux=True):
+        super(Classifier, self).__init__()
+        out_chan = num_classes * up_factor * up_factor
+        self.up_factor = up_factor
+        self.dsconv1 = DSConv(dw_channels, mid_channels, 1)
+        self.dsconv2 = DSConv(mid_channels, up_factor*up_factor, 1)
+        self.conv_out = nn.Sequential(
+            nn.Dropout(0.1),
+            nn.Conv2d(up_factor*up_factor, out_chan, 1),
+            nn.PixelShuffle(up_factor)
+        )
+        
+    
+    def forward(self, x):
+        x = self.dsconv1(x)
+        x = self.dsconv2(x)
+        x = self.conv_out(x)
+        return x
+
 
 class UpSample(nn.Module):
 
@@ -86,7 +176,7 @@ class StemBlock(nn.Module):
         feat_right = self.right(feat)
         feat = torch.cat([feat_left, feat_right], dim=1)
         feat = self.fuse(feat)
-        return feat
+        return feat # H/4/ W/4, 16
 
 
 class CEBlock(nn.Module):
@@ -96,7 +186,11 @@ class CEBlock(nn.Module):
         self.bn = nn.BatchNorm2d(128)
         self.conv_gap = ConvBNReLU(128, 128, 1, stride=1, padding=0)
         #TODO: in paper here is naive conv2d, no bn-relu
-        self.conv_last = ConvBNReLU(128, 128, 3, stride=1)
+        # self.conv_last = ConvBNReLU(128, 128, 3, stride=1)
+        self.conv_last = nn.Conv2d(
+                128, 128, kernel_size=3, stride=1,
+                padding=1, groups=128, bias=False)
+       
 
     def forward(self, x):
         feat = torch.mean(x, dim=(2, 3), keepdim=True)
@@ -109,16 +203,16 @@ class CEBlock(nn.Module):
 
 class GELayerS1(nn.Module):
 
-    def __init__(self, in_chan, out_chan, exp_ratio=6):
+    def __init__(self, in_chan, out_chan, exp_ratio=6, dilation=1, padding=1):
         super(GELayerS1, self).__init__()
         mid_chan = in_chan * exp_ratio
         self.conv1 = ConvBNReLU(in_chan, in_chan, 3, stride=1)
         self.dwconv = nn.Sequential(
             nn.Conv2d(
                 in_chan, mid_chan, kernel_size=3, stride=1,
-                padding=1, groups=in_chan, bias=False),
+                padding=padding, dilation=dilation, groups=in_chan, bias=False),
             nn.BatchNorm2d(mid_chan),
-            nn.ReLU(inplace=True), # not shown in paper
+            # nn.ReLU(inplace=True), # not shown in paper
         )
         self.conv2 = nn.Sequential(
             nn.Conv2d(
@@ -155,7 +249,7 @@ class GELayerS2(nn.Module):
                 mid_chan, mid_chan, kernel_size=3, stride=1,
                 padding=1, groups=mid_chan, bias=False),
             nn.BatchNorm2d(mid_chan),
-            nn.ReLU(inplace=True), # not shown in paper
+            # nn.ReLU(inplace=True), # not shown in paper
         )
         self.conv2 = nn.Sequential(
             nn.Conv2d(
@@ -191,30 +285,30 @@ class SegmentBranch(nn.Module):
 
     def __init__(self):
         super(SegmentBranch, self).__init__()
-        self.S1S2 = StemBlock()
+        # self.S1S2 = StemBlock() # this is replaced by the shared LTDS
         self.S3 = nn.Sequential(
             GELayerS2(16, 32),
-            GELayerS1(32, 32),
+            GELayerS1(32, 32, 6, 2, 2), # dilated
         )
         self.S4 = nn.Sequential(
             GELayerS2(32, 64),
-            GELayerS1(64, 64),
+            GELayerS1(64, 64, 6, 2, 2), # dilated
         )
         self.S5_4 = nn.Sequential(
             GELayerS2(64, 128),
-            GELayerS1(128, 128),
+            GELayerS1(128, 128, 6, 2, 2), # dilated
             GELayerS1(128, 128),
             GELayerS1(128, 128),
         )
         self.S5_5 = CEBlock()
 
     def forward(self, x):
-        feat2 = self.S1S2(x)
-        feat3 = self.S3(feat2)
+        # feat2 = self.S1S2(x)
+        feat3 = self.S3(x) # x is giong to come in from the LTDS block now, as a H/8, W/8, 16 channel bock
         feat4 = self.S4(feat3)
         feat5_4 = self.S5_4(feat4)
         feat5_5 = self.S5_5(feat5_4)
-        return feat2, feat3, feat4, feat5_4, feat5_5
+        return feat3, feat4, feat5_4, feat5_5
 
 
 class BGALayer(nn.Module):
@@ -260,7 +354,7 @@ class BGALayer(nn.Module):
                 128, 128, kernel_size=3, stride=1,
                 padding=1, bias=False),
             nn.BatchNorm2d(128),
-            nn.ReLU(inplace=True), # not shown in paper
+            # nn.ReLU(inplace=True), # not shown in paper
         )
 
     def forward(self, x_d, x_s):
@@ -311,24 +405,28 @@ class BiSeNetV2(nn.Module):
     def __init__(self, n_classes, output_aux=True):
         super(BiSeNetV2, self).__init__()
         self.output_aux = output_aux
-        self.detail = DetailBranch()
+        self.ltds = LearningToDownsample(32, 48, 64) # returns semantic, detail branches
+        
+        # self.detail = DetailBranch() # this is replaced by the LTDS entirely
         self.segment = SegmentBranch()
         self.bga = BGALayer()
 
         ## TODO: what is the number of mid chan ?
-        self.head = SegmentHead(128, 1024, n_classes, up_factor=8, aux=False)
+        self.head = Classifier(128, 128, n_classes, up_factor=8, aux=False)
+        # self.head = SegmentHead(128, 1024, n_classes, up_factor=8, aux=False)
         if self.output_aux:
             self.aux2 = SegmentHead(16, 128, n_classes, up_factor=4)
             self.aux3 = SegmentHead(32, 128, n_classes, up_factor=8)
             self.aux4 = SegmentHead(64, 128, n_classes, up_factor=16)
             self.aux5_4 = SegmentHead(128, 128, n_classes, up_factor=32)
-
+    
         self.init_weights()
 
     def forward(self, x):
         size = x.size()[2:]
-        feat_d = self.detail(x)
-        feat2, feat3, feat4, feat5_4, feat_s = self.segment(x)
+        # feat_d = self.detail(x)
+        feat2, feat_d = self.ltds(x) # H/8, W/8, 64
+        feat3, feat4, feat5_4, feat_s = self.segment(feat2)
         feat_head = self.bga(feat_d, feat_s)
 
         logits = self.head(feat_head)
@@ -355,54 +453,8 @@ class BiSeNetV2(nn.Module):
 
 
 if __name__ == "__main__":
-    #  x = torch.randn(16, 3, 1024, 2048)
-    #  detail = DetailBranch()
-    #  feat = detail(x)
-    #  print('detail', feat.size())
-    #
-    #  x = torch.randn(16, 3, 1024, 2048)
-    #  stem = StemBlock()
-    #  feat = stem(x)
-    #  print('stem', feat.size())
-    #
-    #  x = torch.randn(16, 128, 16, 32)
-    #  ceb = CEBlock()
-    #  feat = ceb(x)
-    #  print(feat.size())
-    #
-    #  x = torch.randn(16, 32, 16, 32)
-    #  ge1 = GELayerS1(32, 32)
-    #  feat = ge1(x)
-    #  print(feat.size())
-    #
-    #  x = torch.randn(16, 16, 16, 32)
-    #  ge2 = GELayerS2(16, 32)
-    #  feat = ge2(x)
-    #  print(feat.size())
-    #
-    #  left = torch.randn(16, 128, 64, 128)
-    #  right = torch.randn(16, 128, 16, 32)
-    #  bga = BGALayer()
-    #  feat = bga(left, right)
-    #  print(feat.size())
-    #
-    #  x = torch.randn(16, 128, 64, 128)
-    #  head = SegmentHead(128, 128, 19)
-    #  logits = head(x)
-    #  print(logits.size())
-    #
-    #  x = torch.randn(16, 3, 1024, 2048)
-    #  segment = SegmentBranch()
-    #  feat = segment(x)[0]
-    #  print(feat.size())
-    #
     x = torch.randn(16, 3, 1024, 2048)
     model = BiSeNetV2(n_classes=19)
     outs = model(x)
     for out in outs:
         print(out.size())
-    #  print(logits.size())
-
-    #  for name, param in model.named_parameters():
-    #      if len(param.size()) == 1:
-    #          print(name)
