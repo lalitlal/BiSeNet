@@ -10,6 +10,7 @@ import logging
 import time
 import argparse
 import numpy as np
+import shutil
 from tabulate import tabulate
 
 import torch
@@ -52,11 +53,15 @@ def parse_args():
     parse.add_argument('--port', dest='port', type=int, default=44554,)
     parse.add_argument('--model', dest='model', type=str, default='bisenetv2',)
     parse.add_argument('--finetune-from', type=str, default=None,)
+    parse.add_argument('--save-folder', default='./weights',
+                        help='Directory for saving checkpoint models')
+    parse.add_argument('--start_epoch', type=int, default=0,
+                        metavar='N', help='start epochs (default:0)')
     return parse.parse_args()
 
 args = parse_args()
 cfg = cfg_factory[args.model]
-
+cfg.max_iter -= args.start_epoch
 
 
 def set_model():
@@ -159,7 +164,8 @@ def train():
     lr_schdr = WarmupPolyLrScheduler(optim, power=0.9,
         max_iter=cfg.max_iter, warmup_iter=cfg.warmup_iters,
         warmup_ratio=0.1, warmup='exp', last_epoch=-1,)
-
+    
+    print('starting from {}'.format(cfg.max_iter - args.start_epoch))
     ## train loop
     for it, (im, lb) in enumerate(dl):
         im = im.cuda()
@@ -193,6 +199,8 @@ def train():
             print_log_msg(
                 it, cfg.max_iter, lr, time_meter, loss_meter,
                 loss_pre_meter, loss_aux_meters)
+        if(it) % 1000 == 0:
+            save_checkpoint('bisenet_citys_{}.pth'.format(it), net.module.state_dict())
 
     ## dump the final model and evaluate the result
     save_pth = osp.join(cfg.respth, 'model_final.pth')
@@ -207,6 +215,12 @@ def train():
 
     return
 
+def save_checkpoint(modelname, modelstate):
+    """Save Checkpoint"""
+    save_path = osp.join(cfg.respth, modelname)
+    if not os.path.exists(cfg.respth):
+        os.makedirs(cfg.respth)
+    torch.save(modelstate, save_path)
 
 def main():
     torch.cuda.set_device(args.local_rank)
