@@ -55,13 +55,11 @@ def parse_args():
     parse.add_argument('--finetune-from', type=str, default=None,)
     parse.add_argument('--save-folder', default='./weights',
                         help='Directory for saving checkpoint models')
-    parse.add_argument('--start_epoch', type=int, default=0,
-                        metavar='N', help='start epochs (default:0)')
     return parse.parse_args()
 
 args = parse_args()
 cfg = cfg_factory[args.model]
-cfg.max_iter -= args.start_epoch
+
 
 
 def set_model():
@@ -164,8 +162,7 @@ def train():
     lr_schdr = WarmupPolyLrScheduler(optim, power=0.9,
         max_iter=cfg.max_iter, warmup_iter=cfg.warmup_iters,
         warmup_ratio=0.1, warmup='exp', last_epoch=-1,)
-    
-    print('starting from {}'.format(cfg.max_iter - args.start_epoch))
+
     ## train loop
     for it, (im, lb) in enumerate(dl):
         im = im.cuda()
